@@ -1,7 +1,15 @@
 -- ====================================================
--- BankOS v2 - Systeme Bancaire Securise (Monobloc + Serveur)
---   bankos              -> lance la banque
---   bankos resetadmin   -> regenere le PIN du compte admin cache
+-- BankOS v2 - Systeme Bancaire Securise (UN SEUL FICHIER)
+--
+--   BankOS              -> lance la banque (serveur + ATM)
+--   BankOS resetadmin   -> regenere le PIN du compte admin cache
+--
+-- Sur l'ordinateur d'une boutique (copier BankOS.lua + bank_network.key) :
+--   local bank = require("BankOS")
+--   bank.init()
+--   local ok, msg = bank.pay("Steve", "1234", 250, "BoutiqueBob",
+--                            { memo = "Diamant x2", source = "balance" })
+--   -- source = "balance" (compte, defaut) ou "wallet" (argent sur la carte)
 -- ====================================================
 
 -- ---------- CONFIGURATION ----------
@@ -40,6 +48,17 @@ local function loanRate(amount)
     end
     return LOAN_TIERS[#LOAN_TIERS].rate
 end
+
+local DAY_MS       = 86400000     -- 24 h reelles
+local SAVINGS_CAP  = 1000000      -- les interets d'epargne sont calcules jusqu'a ce plafond
+-- Valeurs par defaut, modifiables en jeu depuis le panneau admin (Reglages)
+local DEFAULTS = { transferFee = 0.01, savingsRate = 0.005, lateRate = 0.05, loanDays = 7 }
+local SETTINGS = {
+    { key = "transferFee", label = "Frais virement",    step = 0.005, min = 0, max = 0.2,  pct = true },
+    { key = "savingsRate", label = "Epargne / jour",    step = 0.001, min = 0, max = 0.05, pct = true },
+    { key = "lateRate",    label = "Penalite retard/j", step = 0.01,  min = 0, max = 0.5,  pct = true },
+    { key = "loanDays",    label = "Duree pret (jours)", step = 1,    min = 1, max = 90 },
+}
 
 -- ====================================================
 -- 1. CRYPTOGRAPHIE : SHA-256, HMAC, chiffrement authentifie
@@ -248,6 +267,12 @@ end
 local bankData = { accounts = {}, globalHistory = {} }
 local dirty = false
 
+local function setting(key)
+    local v = bankData.settings and bankData.settings[key]
+    if v == nil then return DEFAULTS[key] end
+    return v
+end
+
 local function markDirty()
     dirty = true
     os.queueEvent("bank_update")
@@ -257,7 +282,7 @@ local function newAccount(pin, balance, hidden)
     local salt = toHex(randomBytes(8))
     return {
         pinSalt = salt, pinHash = hashPin(pin, salt),
-        balance = balance or 0, wallet = 0, history = {},
+        balance = balance or 0, wallet = 0, history = {}, savings = 0, savingsTs = 0,
         fails = 0, lockUntil = 0, hidden = hidden or nil,
     }
 end
@@ -347,11 +372,21 @@ local function loadData()
         migrateLegacy()
     end
     bankData.globalHistory = bankData.globalHistory or {}
+    bankData.settings = bankData.settings or {}
+    bankData.adminLog = bankData.adminLog or {}
+    bankData.treasury = bankData.treasury or 0
+    local now = os.epoch("utc")
     for _, a in pairs(bankData.accounts) do
         a.history = a.history or {}
         a.wallet = a.wallet or 0
         a.fails = a.fails or 0
         a.lockUntil = a.lockUntil or 0
+        a.savings = a.savings or 0
+        a.savingsTs = a.savingsTs or now
+        if a.loan then
+            a.loan.due = a.loan.due or ((a.loan.ts or now) + setting("loanDays") * DAY_MS)
+            a.loan.lateDays = a.loan.lateDays or 0
+        end
     end
 end
 
@@ -437,6 +472,55 @@ local function logTransaction(accName, kind, text)
         while #g > HISTORY_GLOBAL do table.remove(g, 1) end
     end
     markDirty()
+end
+
+local function adminNote(text)
+    bankData.adminLog = bankData.adminLog or {}
+    local g = bankData.adminLog
+    g[#g + 1] = { s = "[" .. os.date("%d/%m %H:%M") .. "] " .. text }
+    while #g > 100 do table.remove(g, 1) end
+    markDirty()
+end
+
+-- Taches periodiques : interets d'epargne, prelevement des prets echus, penalites de retard
+local function applyPeriodic()
+    local now = os.epoch("utc")
+    for name, a in pairs(bankData.accounts) do
+        if (a.savings or 0) > 0 then
+            local days = math.floor((now - (a.savingsTs or now)) / DAY_MS)
+            if days >= 1 then
+                a.savingsTs = (a.savingsTs or now) + days * DAY_MS
+                local interest = math.floor(math.min(a.savings, SAVINGS_CAP) * setting("savingsRate") * days)
+                if interest > 0 then
+                    a.savings = a.savings + interest
+                    logTransaction(name, "in", "+$" .. fmt(interest) .. " (Interets epargne)")
+                else
+                    markDirty()
+                end
+            end
+        end
+        local l = a.loan
+        if l and now > l.due then
+            local take = math.min(a.balance, l.owed)
+            if take > 0 then
+                a.balance = a.balance - take
+                l.owed = l.owed - take
+                logTransaction(name, "out", "-$" .. fmt(take) .. " (Pret echu : prelevement)")
+            end
+            if l.owed <= 0 then
+                a.loan = nil
+                markDirty()
+            else
+                local days = math.floor((now - l.due) / DAY_MS)
+                while (l.lateDays or 0) < days do
+                    local pen = math.max(1, math.ceil(l.owed * setting("lateRate")))
+                    l.owed = l.owed + pen
+                    l.lateDays = (l.lateDays or 0) + 1
+                    logTransaction(name, "out", "Penalite de retard +$" .. fmt(pen) .. " a payer")
+                end
+            end
+        end
+    end
 end
 
 -- ====================================================
@@ -756,13 +840,255 @@ local function drawWidget(ctx, session)
     end
     put(ctx, 3, 3, "TITULAIRE : ", colors.lightBlue, colors.black)
     put(ctx, 15, 3, session.name, colors.white)
-    put(ctx, 3, 4, string.rep("-", ctx.w - 4), colors.gray)
-    put(ctx, 3, 5, "COMPTE : $ " .. fmt(a.balance), colors.lime)
+    put(ctx, 3, 4, "COMPTE : $ " .. fmt(a.balance), colors.lime)
+    put(ctx, 3, 5, "EPARGNE: $ " .. fmt(a.savings or 0), colors.cyan)
     put(ctx, 3, 6, "CARTE  : $ " .. fmt(a.wallet), colors.yellow)
     if a.loan then
-        put(ctx, 3, 7, "DETTE  : $ " .. fmt(a.loan.owed), colors.red)
+        local left = a.loan.due - os.epoch("utc")
+        local txt = left > 0 and string.format("(%dj)", math.ceil(left / DAY_MS)) or "(RETARD)"
+        put(ctx, 3, 7, "DETTE  : $ " .. fmt(a.loan.owed) .. " " .. txt, colors.red)
     else
         put(ctx, 3, 7, "Aucune dette", colors.gray)
+    end
+end
+
+-- ====================================================
+-- 8b. PANNEAU ADMIN (reserve au compte cache)
+-- ====================================================
+-- Hauteur/espacement de n boutons verticaux entre top et bottom
+local function vlayout(n, top, bottom)
+    local avail = bottom - top + 1
+    if n * 3 - 1 <= avail then return 2, 1 end
+    if n * 2 - 1 <= avail then return 1, 1 end
+    return 1, 0
+end
+
+local function runAdminPanel(ctx, session)
+    local function me() return bankData.accounts[session.name] end
+
+    local function waitAction(title)
+        while not ctx.timedOut do
+            local ev, p1, p2 = pullCtxEvent(ctx)
+            if ev == "timeout" then return nil
+            elseif ev == "tick" then drawHeader(ctx, title)
+            elseif ev == "touch" then
+                local cb = handleTouch(ctx, p1, p2)
+                if cb then return cb() end
+            end
+        end
+    end
+
+    local function amount(title)
+        local n = tonumber(getNumpadInput(ctx, title, false, true))
+        if n and n >= 1 then return n end
+        return nil
+    end
+
+    local function vbuttons(items, top, bottom, x, w)
+        local bH, gap = vlayout(#items, top, bottom)
+        for i, it in ipairs(items) do
+            addButton(ctx, it[1], it[2], x, top + (i - 1) * (bH + gap), w, bH, bc(ctx, it[3]), colors.black, ret(it[1]))
+        end
+    end
+
+    local function showLines(title, lines)
+        clr(ctx); clearButtons(ctx); drawHeader(ctx, title)
+        addButton(ctx, "back", "Retour", 2, ctx.h - 1, ctx.w - 3, 1, bc(ctx, colors.lightBlue), colors.black, ret("back"))
+        drawButtons(ctx)
+        for i, l in ipairs(lines) do
+            if 2 + i >= ctx.h - 1 then break end
+            put(ctx, 2, 2 + i, l, colors.white)
+        end
+        waitAction(title)
+    end
+
+    local function statsLines()
+        local n, bal, sav, wal, dN, dSum, late = 0, 0, 0, 0, 0, 0, 0
+        local now = os.epoch("utc")
+        for _, a in pairs(bankData.accounts) do
+            if not a.hidden then
+                n = n + 1
+                bal = bal + a.balance
+                sav = sav + (a.savings or 0)
+                wal = wal + (a.wallet or 0)
+                if a.loan then
+                    dN = dN + 1
+                    dSum = dSum + a.loan.owed
+                    if now > a.loan.due then late = late + 1 end
+                end
+            end
+        end
+        return {
+            "Comptes joueurs : " .. n,
+            "Sur les comptes : $" .. fmt(bal),
+            "En epargne      : $" .. fmt(sav),
+            "Sur les cartes  : $" .. fmt(wal),
+            "Argent total    : $" .. fmt(bal + sav + wal),
+            "Prets en cours  : " .. dN .. " ($" .. fmt(dSum) .. ")",
+            "Prets en retard : " .. late,
+            "Frais collectes : $" .. fmt(bankData.treasury or 0),
+        }
+    end
+
+    local function accountScreen(name)
+        while not ctx.timedOut do
+            local a = bankData.accounts[name]
+            if not a then return end
+            local title = "Compte " .. name
+            clr(ctx); clearButtons(ctx); drawHeader(ctx, title)
+            put(ctx, 2, 3, "Compte : $" .. fmt(a.balance) .. "   Epargne : $" .. fmt(a.savings or 0), colors.white)
+            put(ctx, 2, 4, "Carte  : $" .. fmt(a.wallet) .. (a.loan and ("   Dette : $" .. fmt(a.loan.owed)) or ""), colors.white)
+            local status = a.frozen and "GELE" or "actif"
+            if (a.lockUntil or 0) > os.epoch("utc") then status = status .. " / PIN verrouille" end
+            put(ctx, 2, 5, "Statut : " .. status, colors.yellow)
+            vbuttons({
+                { "freeze", a.frozen and "Degeler" or "Geler le compte", colors.orange },
+                { "unlock", "Debloquer le PIN", colors.cyan },
+                { "credit", "Ajouter de l'argent", colors.green },
+                { "debit", "Retirer de l'argent", colors.pink },
+                { "forgive", "Effacer la dette", colors.yellow },
+                { "delete", "Supprimer le compte", colors.red },
+                { "back", "Retour", colors.lightBlue },
+            }, 7, ctx.h - 1, 2, ctx.w - 3)
+            drawButtons(ctx); drawFooter(ctx, "Admin > " .. name)
+            local action = waitAction(title)
+            if not action or action == "back" then return end
+            a = bankData.accounts[name]
+            if action == "freeze" then
+                a.frozen = (not a.frozen) or nil
+                adminNote((a.frozen and "Gel de " or "Degel de ") .. name)
+            elseif action == "unlock" then
+                a.fails, a.lockUntil = 0, 0
+                adminNote("PIN debloque : " .. name)
+            elseif action == "credit" then
+                local amt = amount("Ajouter $")
+                if amt then
+                    a.balance = a.balance + amt
+                    logTransaction(name, "in", "+$" .. fmt(amt) .. " (Ajustement)")
+                    adminNote("+$" .. fmt(amt) .. " a " .. name)
+                end
+            elseif action == "debit" then
+                local amt = amount("Retirer $")
+                if amt then
+                    amt = math.min(amt, a.balance)
+                    a.balance = a.balance - amt
+                    logTransaction(name, "out", "-$" .. fmt(amt) .. " (Ajustement)")
+                    adminNote("-$" .. fmt(amt) .. " a " .. name)
+                end
+            elseif action == "forgive" then
+                if a.loan then
+                    a.loan = nil
+                    logTransaction(name, "info", "Dette effacee")
+                    adminNote("Dette effacee : " .. name)
+                end
+            elseif action == "delete" then
+                if confirmDialog(ctx, "Supprimer ?", { "Supprimer definitivement", name, "et tout son argent ?" }) then
+                    bankData.accounts[name] = nil
+                    adminNote("Compte supprime : " .. name)
+                    markDirty()
+                    return
+                end
+            end
+            markDirty()
+        end
+    end
+
+    local function accountList()
+        local page = 1
+        while not ctx.timedOut do
+            local names = {}
+            for n, a in pairs(bankData.accounts) do
+                if not a.hidden then names[#names + 1] = n end
+            end
+            table.sort(names, function(x, y) return bankData.accounts[x].balance > bankData.accounts[y].balance end)
+            local per = math.max(1, ctx.h - 5)
+            local pages = math.max(1, math.ceil(#names / per))
+            if page > pages then page = pages end
+            local title = "Comptes " .. page .. "/" .. pages
+            clr(ctx); clearButtons(ctx); drawHeader(ctx, title)
+            for i = 1, per do
+                local name = names[(page - 1) * per + i]
+                if not name then break end
+                local a = bankData.accounts[name]
+                local label = name .. "  $" .. fmt(a.balance) .. (a.loan and " [dette]" or "") .. (a.frozen and " [GELE]" or "")
+                addButton(ctx, "acc" .. i, label, 2, 2 + i, ctx.w - 3, 1, bc(ctx, colors.lightGray), colors.black, ret("acc:" .. name))
+            end
+            if #names == 0 then put(ctx, 2, 3, "Aucun compte joueur", colors.gray) end
+            addButton(ctx, "prev", "<", 2, ctx.h - 1, 5, 1, bc(ctx, colors.cyan), colors.black, ret("prev"))
+            addButton(ctx, "back", "Retour", 8, ctx.h - 1, ctx.w - 15, 1, bc(ctx, colors.lightBlue), colors.black, ret("back"))
+            addButton(ctx, "next", ">", ctx.w - 5, ctx.h - 1, 5, 1, bc(ctx, colors.cyan), colors.black, ret("next"))
+            drawButtons(ctx); drawFooter(ctx, "Touchez un compte")
+            local action = waitAction(title)
+            if not action or action == "back" then return end
+            if action == "prev" then page = math.max(1, page - 1)
+            elseif action == "next" then page = math.min(pages, page + 1)
+            elseif action:sub(1, 4) == "acc:" then accountScreen(action:sub(5)) end
+        end
+    end
+
+    local function settingsScreen()
+        while not ctx.timedOut do
+            clr(ctx); clearButtons(ctx); drawHeader(ctx, "Reglages")
+            for i, st in ipairs(SETTINGS) do
+                local y = 2 + i * 2
+                local v = setting(st.key)
+                local txt = st.pct and string.format("%.1f%%", v * 100) or tostring(v)
+                put(ctx, 2, y, st.label .. " : " .. txt, colors.white)
+                addButton(ctx, "m" .. i, "-", ctx.w - 9, y, 3, 1, bc(ctx, colors.red), colors.black, ret("m" .. i))
+                addButton(ctx, "p" .. i, "+", ctx.w - 5, y, 3, 1, bc(ctx, colors.green), colors.black, ret("p" .. i))
+            end
+            put(ctx, 2, ctx.h - 3, "Les taux s'appliquent par jour reel (24 h)", colors.gray)
+            addButton(ctx, "back", "Retour", 2, ctx.h - 1, ctx.w - 3, 1, bc(ctx, colors.lightBlue), colors.black, ret("back"))
+            drawButtons(ctx); drawFooter(ctx, "- / + pour ajuster")
+            local action = waitAction("Reglages")
+            if not action or action == "back" then return end
+            local st = SETTINGS[tonumber(action:sub(2))]
+            if st then
+                local dir = action:sub(1, 1) == "p" and 1 or -1
+                local v = setting(st.key) + dir * st.step
+                v = math.max(st.min, math.min(st.max, v))
+                v = tonumber(string.format("%.4f", v))
+                bankData.settings = bankData.settings or {}
+                bankData.settings[st.key] = v
+                adminNote("Reglage " .. st.key .. " = " .. tostring(v))
+            end
+        end
+    end
+
+    while not ctx.timedOut do
+        local a = me()
+        if not (a and a.hidden) then return end   -- acces strictement reserve au compte cache
+        clr(ctx); clearButtons(ctx); drawHeader(ctx, "Panneau Admin")
+        vbuttons({
+            { "stats", "Statistiques", colors.cyan },
+            { "accounts", "Comptes", colors.lime },
+            { "settings", "Reglages", colors.yellow },
+            { "journal", "Journal admin", colors.lightBlue },
+            { "collect", "Collecter les frais", colors.orange },
+            { "back", "Retour", colors.red },
+        }, 3, ctx.h - 2, 2, ctx.w - 3)
+        drawButtons(ctx); drawFooter(ctx, "Admin : " .. session.name)
+        local action = waitAction("Panneau Admin")
+        if not action or action == "back" then return end
+        if action == "stats" then showLines("Statistiques", statsLines())
+        elseif action == "accounts" then accountList()
+        elseif action == "settings" then settingsScreen()
+        elseif action == "journal" then
+            local lines = {}
+            for i = #bankData.adminLog, 1, -1 do lines[#lines + 1] = bankData.adminLog[i].s end
+            if #lines == 0 then lines[1] = "(journal vide)" end
+            showLines("Journal admin", lines)
+        elseif action == "collect" then
+            local t = bankData.treasury or 0
+            if t >= 1 then
+                a.balance = a.balance + t
+                bankData.treasury = 0
+                adminNote("Frais collectes : $" .. fmt(t))
+                flash(ctx, "Succes", "$" .. fmt(t) .. " collectes", colors.lime)
+            else
+                flash(ctx, "Frais", "Rien a collecter", colors.red)
+            end
+        end
     end
 end
 
@@ -831,10 +1157,25 @@ local function runDashboard(ctx, session)
         local amt = askAmount("Montant Virement")
         if not amt then return end
         local a = acc()
-        if a.balance < amt then return flash(ctx, "Erreur", "Fonds insuffisants", colors.red) end
-        a.balance = a.balance - amt
+        local feeRate = a.hidden and 0 or setting("transferFee")
+        local fee = math.floor(amt * feeRate + 0.5)
+        local total = amt + fee
+        if a.balance < total then return flash(ctx, "Erreur", "Fonds insuffisants", colors.red) end
+        if fee > 0 then
+            local yes = confirmDialog(ctx, "Virement", {
+                "Vers    : " .. target,
+                "Montant : $" .. fmt(amt),
+                "Frais   : $" .. fmt(fee) .. " (" .. string.format("%.1f%%", feeRate * 100) .. ")",
+                "Total   : $" .. fmt(total),
+            })
+            if not yes then return end
+            a = acc()
+            if a.balance < total or not bankData.accounts[target] then return end
+        end
+        a.balance = a.balance - total
         bankData.accounts[target].balance = bankData.accounts[target].balance + amt
-        logTransaction(session.name, "out", "-$" .. fmt(amt) .. " -> " .. target)
+        bankData.treasury = (bankData.treasury or 0) + fee
+        logTransaction(session.name, "out", "-$" .. fmt(total) .. " -> " .. target .. (fee > 0 and (" (frais $" .. fmt(fee) .. ")") or ""))
         logTransaction(target, "in", "+$" .. fmt(amt) .. " <- " .. shownName(session.name))
         flash(ctx, "Succes", "Virement effectue !", colors.lime)
     end
@@ -856,12 +1197,15 @@ local function runDashboard(ctx, session)
             "Taux     : " .. pct,
             "Interets : $" .. fmt(interest),
             "A rendre : $" .. fmt(owed),
+            "Echeance : " .. setting("loanDays") .. " jours",
         })
         if not yes then return end
         a = acc()
         if a.loan then return end
         a.balance = a.balance + amt
-        a.loan = { principal = amt, owed = owed, rate = rate, ts = os.epoch("utc") }
+        local nowMs = os.epoch("utc")
+        a.loan = { principal = amt, owed = owed, rate = rate, ts = nowMs,
+                   due = nowMs + setting("loanDays") * DAY_MS, lateDays = 0 }
         logTransaction(session.name, "in", "+$" .. fmt(amt) .. " (Emprunt " .. pct .. ")")
         flash(ctx, "Succes", "Emprunt accorde !", colors.lime)
     end
@@ -884,6 +1228,63 @@ local function runDashboard(ctx, session)
             flash(ctx, "Succes", "Dette soldee !", colors.lime)
         else
             flash(ctx, "Succes", "Reste $" .. fmt(a.loan.owed), colors.lime)
+        end
+    end
+
+    local function showSavings()
+        while not ctx.timedOut do
+            local a = acc()
+            if not a then return end
+            clr(ctx); clearButtons(ctx); drawHeader(ctx, "Epargne")
+            local rate = setting("savingsRate")
+            put(ctx, 2, 3, "EPARGNE : $ " .. fmt(a.savings or 0), colors.lime)
+            put(ctx, 2, 4, "COMPTE  : $ " .. fmt(a.balance), colors.white)
+            put(ctx, 2, 5, string.format("Taux : %.1f%% par jour", rate * 100), colors.yellow)
+            put(ctx, 2, 6, "Interets/jour : $" .. fmt(math.floor(math.min(a.savings or 0, SAVINGS_CAP) * rate)), colors.lightGray)
+            put(ctx, 2, 7, "Calcul plafonne a $" .. fmt(SAVINGS_CAP), colors.gray)
+            addButton(ctx, "dep", "Deposer sur l'epargne", 2, 9, ctx.w - 3, 2, bc(ctx, colors.green), colors.black, ret("dep"))
+            addButton(ctx, "wd", "Retirer de l'epargne", 2, 12, ctx.w - 3, 2, bc(ctx, colors.orange), colors.black, ret("wd"))
+            addButton(ctx, "back", "Retour", 2, ctx.h - 1, ctx.w - 3, 1, bc(ctx, colors.lightBlue), colors.black, ret("back"))
+            drawButtons(ctx); drawFooter(ctx, "Interets verses chaque jour reel")
+            local action = nil
+            while not action and not ctx.timedOut do
+                local ev, p1, p2 = pullCtxEvent(ctx)
+                if ev == "timeout" then return
+                elseif ev == "tick" then drawHeader(ctx, "Epargne")
+                elseif ev == "touch" then
+                    local cb = handleTouch(ctx, p1, p2)
+                    if cb then action = cb() end
+                end
+            end
+            if not action or action == "back" then return end
+            if action == "dep" then
+                local amt = askAmount("Vers epargne")
+                if amt then
+                    a = acc()
+                    if a.balance < amt then
+                        flash(ctx, "Erreur", "Fonds insuffisants", colors.red)
+                    else
+                        if (a.savings or 0) <= 0 then a.savingsTs = os.epoch("utc") end
+                        a.balance = a.balance - amt
+                        a.savings = (a.savings or 0) + amt
+                        logTransaction(session.name, "out", "-$" .. fmt(amt) .. " (Vers epargne)")
+                        flash(ctx, "Succes", "Argent place !", colors.lime)
+                    end
+                end
+            elseif action == "wd" then
+                local amt = askAmount("Depuis epargne")
+                if amt then
+                    a = acc()
+                    if (a.savings or 0) < amt then
+                        flash(ctx, "Erreur", "Epargne insuffisante", colors.red)
+                    else
+                        a.savings = a.savings - amt
+                        a.balance = a.balance + amt
+                        logTransaction(session.name, "in", "+$" .. fmt(amt) .. " (Depuis epargne)")
+                        flash(ctx, "Succes", "Argent retire !", colors.lime)
+                    end
+                end
+            end
         end
     end
 
@@ -947,28 +1348,26 @@ local function runDashboard(ctx, session)
     end
 
     local function snap(a)
-        return tostring(a.balance) .. ":" .. tostring(a.wallet) .. ":" .. tostring(a.loan and a.loan.owed or 0)
+        return tostring(a.balance) .. ":" .. tostring(a.wallet) .. ":" .. tostring(a.savings or 0) .. ":" .. tostring(a.loan and a.loan.owed or 0)
     end
 
     local actions = {
         depot = doDeposit, retrait = doWithdraw, transfert = doTransfer, emprunt = doLoan,
         rembourser = doRepay, card = doLinkCard, change_pin = doChangePin, history = showHistory,
+        epargne = showSavings,
+        admin = function() if acc() and acc().hidden then runAdminPanel(ctx, session) end end,
     }
 
     while not ctx.timedOut do
         local a = acc()
-        if not a then break end
+        if not a or a.frozen then break end
         if session.viaCard and not ownCard() then break end   -- carte retiree = deconnexion
 
         clr(ctx); clearButtons(ctx)
         drawWidget(ctx, session)
 
         local top = 9
-        local count = ctx.h - 1 - top
-        local bH, gap
-        if 4 * 2 + 3 <= count then bH, gap = 2, 1
-        elseif 4 + 3 <= count then bH, gap = 1, 1
-        else bH, gap = 1, 0 end
+        local bH, gap = vlayout(5, top, ctx.h - 2)
         local colW = math.floor((ctx.w - 5) / 2)
         local c1, c2 = 2, 2 + colW + 1
         local function rowY(i) return top + (i - 1) * (bH + gap) end
@@ -981,6 +1380,10 @@ local function runDashboard(ctx, session)
         addButton(ctx, "rem", "Rembourser", c2, rowY(2), colW, bH, bc(ctx, colors.pink), colors.black, ret("rembourser"))
         addButton(ctx, "crd", "Lier Carte", c2, rowY(3), colW, bH, bc(ctx, colors.yellow), colors.black, ret("card"))
         addButton(ctx, "pin", "Modif. PIN", c2, rowY(4), colW, bH, bc(ctx, colors.cyan), colors.black, ret("change_pin"))
+        addButton(ctx, "epa", "Epargne", c1, rowY(5), colW, bH, bc(ctx, colors.lime), colors.black, ret("epargne"))
+        if a.hidden then
+            addButton(ctx, "adm", "ADMIN", c2, rowY(5), colW, bH, bc(ctx, colors.red), colors.black, ret("admin"))
+        end
         addButton(ctx, "quit", "Deconnexion", 2, ctx.h - 1, ctx.w - 3, 1, bc(ctx, colors.red), colors.black, ret("logout"))
 
         drawButtons(ctx); drawFooter(ctx, "Session : " .. session.name)
@@ -1028,7 +1431,14 @@ local function runAtmTerminal(target_term, target_name, drive_name)
         local pin = getNumpadInput(ctx, "PIN " .. accName, true, true)
         if not pin then ignoredCard = card.id; return nil end
         local ok, why, wait = checkPin(bankData.accounts[accName], pin)
-        if ok then return { name = accName, viaCard = true } end
+        if ok then
+            if bankData.accounts[accName].frozen then
+                ignoredCard = card.id
+                flash(ctx, "Erreur", "Compte gele", colors.red)
+                return nil
+            end
+            return { name = accName, viaCard = true }
+        end
         if why == "locked" then
             ignoredCard = card.id
             flash(ctx, "Verrouille", "Reessayez dans " .. wait .. "s", colors.red)
@@ -1053,7 +1463,13 @@ local function runAtmTerminal(target_term, target_name, drive_name)
         end
         local acc = bankData.accounts[real]
         local ok, why, wait = checkPin(acc, pin)
-        if ok then return { name = real, viaCard = false } end
+        if ok then
+            if acc.frozen then
+                flash(ctx, "Erreur", "Compte gele", colors.red)
+                return nil
+            end
+            return { name = real, viaCard = false }
+        end
         if why == "locked" and not acc.hidden then
             flash(ctx, "Verrouille", "Reessayez dans " .. wait .. "s", colors.red)
         else
@@ -1195,6 +1611,7 @@ local function handleApi(senderId, msg)
         return apiReply(senderId, nonce, false, why == "locked" and "Compte verrouille" or "Identifiants invalides")
     end
 
+    if acc.frozen then return apiReply(senderId, nonce, false, "Compte gele") end
     local target = findAccount(req.target, false)
     if not target then return apiReply(senderId, nonce, false, "Destinataire inconnu") end
     if target == accName then return apiReply(senderId, nonce, false, "Paiement a soi-meme impossible") end
@@ -1257,9 +1674,59 @@ local function runServer(showLogs)
 end
 
 -- ====================================================
--- LANCEMENT : 1 ATM (moniteur) + 1 SERVEUR (ecran interne)
+-- MODE CLIENT : require("BankOS") renvoie l'API de paiement Rednet
+-- (aucun serveur n'est lance dans ce cas)
 -- ====================================================
 local args = { ... }
+
+if args[1] ~= nil and args[1] ~= "resetadmin" then
+    local M = {}
+
+    function M.init(keyFile)
+        local f = fs.open(keyFile or NET_KEY_FILE, "r")
+        if not f then error(NET_KEY_FILE .. " introuvable", 2) end
+        NET_KEY = (f.readAll() or ""):gsub("%s", "")
+        f.close()
+        for _, n in ipairs(peripheral.getNames()) do
+            if peripheral.getType(n) == "modem" and not rednet.isOpen(n) then rednet.open(n) end
+        end
+    end
+
+    -- Retourne ok (bool), message (string), reponse complete (table)
+    function M.pay(account, pin, amount, target, opts)
+        if not NET_KEY then M.init() end
+        opts = opts or {}
+        local nonce = toHex(randomBytes(16))
+        local req = {
+            type = "PAYMENT", ts = os.epoch("utc"), nonce = nonce,
+            account = account, pin = tostring(pin), amount = amount, target = target,
+            source = opts.source, memo = opts.memo,
+        }
+        rednet.broadcast(encrypt(textutils.serialize(req), NET_KEY), PROTOCOL)
+
+        local timer = os.startTimer(opts.timeout or 5)
+        while true do
+            local ev, a, b, c = os.pullEvent()
+            if ev == "rednet_message" and c == PROTOCOL and type(b) == "string" then
+                local plain = decrypt(b, NET_KEY)
+                local resp = plain and textutils.unserialize(plain)
+                -- reponse authentique, recente et liee a NOTRE requete
+                if type(resp) == "table" and resp.nonce == nonce and type(resp.ts) == "number"
+                    and math.abs(os.epoch("utc") - resp.ts) < API_WINDOW_MS then
+                    return resp.ok == true, tostring(resp.message), resp
+                end
+            elseif ev == "timer" and a == timer then
+                return false, "Pas de reponse de la banque"
+            end
+        end
+    end
+
+    return M
+end
+
+-- ====================================================
+-- LANCEMENT : 1 ATM (moniteur) + 1 SERVEUR (ecran interne)
+-- ====================================================
 
 initKeys()
 loadData()
@@ -1274,6 +1741,7 @@ local tasks = {}
 tasks[#tasks + 1] = function()
     while true do
         sleep(1)
+        pcall(applyPeriodic)
         if dirty then saveNow() end
         os.queueEvent("bank_tick")
     end
