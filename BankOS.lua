@@ -564,7 +564,6 @@ local function runAtmTerminal(target_term, target_name, drive_name)
                 ctx.t.setTextColor(colors.lime)
                 ctx.t.write("$ " .. string.format("%.2f", acc.balance))
 
-                -- Disposition 2 Colonnes
                 local colW = math.floor((ctx.w - 5) / 2)
                 local col1X = 2
                 local col2X = 2 + colW + 1
@@ -784,7 +783,6 @@ loadData()
 
 local tasks = {}
 
--- Task 1 : Horloge système
 table.insert(tasks, function()
     while true do
         sleep(1)
@@ -792,10 +790,8 @@ table.insert(tasks, function()
     end
 end)
 
--- Task 2 : Serveur de logs sur l'écran interne du PC
 table.insert(tasks, runServerLogAndAPI)
 
--- Task 3 : ATM Terminal sur le moniteur externe (ou repli sur l'écran interne si absent)
 local monitor = peripheral.find("monitor")
 local drive = peripheral.find("drive")
 local driveName = drive and peripheral.getName(drive) or nil
