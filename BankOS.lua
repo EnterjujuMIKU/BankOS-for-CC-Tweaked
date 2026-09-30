@@ -50,7 +50,7 @@ local function loanRate(amount)
 end
 
 local DAY_MS       = 86400000     -- 24 h reelles
-local SAVINGS_CAP  = 1000000      -- les interets d'epargne sont calcules jusqu'a ce plafond
+local SAVINGS_CAP  = 250000      -- les interets d'epargne sont calcules jusqu'a ce plafond
 -- Valeurs par defaut, modifiables en jeu depuis le panneau admin (Reglages)
 local DEFAULTS = { transferFee = 0.01, savingsRate = 0.005, lateRate = 0.05, loanDays = 7 }
 local SETTINGS = {
@@ -231,8 +231,8 @@ local MASTER_KEY, CARD_KEY, NET_KEY
 local function gatherEntropy()
     term.clear(); term.setCursorPos(1, 1)
     print("Premiere installation : generation des cles.")
-    print("Tapez 30 touches au hasard, a rythme irregulier :")
-    for i = 1, 30 do
+    print("Tapez 20 touches au hasard, a rythme irregulier :")
+    for i = 1, 20 do
         local _, key = os.pullEvent("key")
         mixEntropy(tostring(key) .. ":" .. i)
         write("*")
@@ -1515,13 +1515,13 @@ local function runAtmTerminal(target_term, target_name, drive_name)
             else
                 clr(ctx); clearButtons(ctx)
                 drawHeader(ctx, "BankOS - Accueil")
-                put(ctx, 2, 3, "=== DISTRIBUTEUR ATM ===", colors.cyan, colors.black)
+                local btnW = ctx.w - 2
+                put(ctx, btnW / 2 - 4, 3, "=== ATM ===", colors.cyan, colors.black)
                 local msg = "Inserez votre carte bancaire"
                 if ignoredCard then msg = "Retirez votre carte"
                 elseif status == "blank" then msg = "Carte vierge : connectez-vous"
                 elseif status == "invalid" then msg = "Carte illisible" end
                 drawFooter(ctx, msg)
-                local btnW = ctx.w - 4
                 addButton(ctx, "btn_log", "Se Connecter", 2, 6, btnW, 2, bc(ctx, colors.green), colors.black, ret("login"))
                 addButton(ctx, "btn_reg", "S'inscrire", 2, 9, btnW, 2, bc(ctx, colors.cyan), colors.black, ret("register"))
                 drawButtons(ctx)
